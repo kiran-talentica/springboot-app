@@ -1,44 +1,122 @@
 pipeline {
     agent any
 
-    environment {
-        registry = "024848443289.dkr.ecr.us-east-1.amazonaws.com/nodejs-ecs-app"
+    parameters {
+        string(name: 'BRANCH_NAME', defaultValue: 'dev', description: 'Branch to checkout')
+        booleanParam(name: 'SONARQUBE', defaultValue: false, description: 'Run SonarQube analysis?')
+        choice(name: 'DEPLOY_ENV', choices: ['beta', 'stage', 'prod'], description: 'Select deployment environment')
     }
-    
+
+    environment {
+        AWS_ACCOUNT_ID = "024848443289"
+        AWS_DEFAULT_REGION = "us-east-1"
+        IMAGE_TAG = "v1"
+        REPOSITORY_URI = "024848443289.dkr.ecr.us-east-1.amazonaws.com/nodejs-ecs-app"
+        
+        // Default values
+        APP_PATH = "/default/path"
+    }
+
     stages {
-        stage('Checkout') {
+        stage('Initialize') {
             steps {
-                checkout scmGit(branches: [[name: '*/main']], extensions: [], userRemoteConfigs: [[url: 'https://github.com/kiran-talentica/springboot-app']])
+                script {
+                    echo "Branch Name: ${params.BRANCH_NAME}"
+                    echo "Deployment Environment: ${params.DEPLOY_ENV}"
+                }
             }
         }
-        
-        stage ("build Jar") {
+
+        stage('Set Environment Variables') {
+            steps {
+                script {
+                    if (params.DEPLOY_ENV == 'beta') {
+                        env.APP_PATH = "/path/to/beta/folder"
+                    } else if (params.DEPLOY_ENV == 'stage') {
+                        env.APP_PATH = "/path/to/stage/folder"
+                    } else if (params.DEPLOY_ENV == 'prod') {
+                        env.APP_PATH = "/path/to/prod/folder"
+                    }
+                }
+            }
+        }
+
+        stage('Checkout') {
+            steps {
+                script {
+                    checkout scmGit(branches: [[name: "*/${params.BRANCH_NAME}"]],
+                                    extensions: [],
+                                    userRemoteConfigs: [[url: 'https://github.com/kiran-talentica/springboot-app', credentialsId: 'jssh']])
+                }
+            }
+        }
+
+        stage('Logging into AWS ECR') {
+            steps {
+                script {
+                    def ecrUri
+                    if (params.DEPLOY_ENV == 'beta') {
+                        ecrUri = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/beta-nodejs-ecs-app"
+                    } else if (params.DEPLOY_ENV == 'stage') {
+                        ecrUri = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/stage-nodejs-ecs-app"
+                    } else {
+                        ecrUri = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/prod-nodejs-ecs-app"
+                    }
+                    sh """aws ecr get-login-password --region ${AWS_DEFAULT_REGION} | docker login --username AWS --password-stdin ${ecrUri}"""
+                }
+            }
+        }
+
+        stage("Build Jar") {
             steps {
                 sh "mvn clean install"
             }
         }
-        
-        stage ("Build image") {
+
+        stage("Build Image") {
             steps {
                 script {
-                    docker.build registry
+                    def imageName = "${REPOSITORY_URI}:${IMAGE_TAG}"
+                    docker.build(imageName)
                 }
             }
         }
-        
-        stage ("Push to ECR") {
+
+        stage("Push to ECR") {
             steps {
-                sh "aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin 024848443289.dkr.ecr.us-east-1.amazonaws.com/nodejs-ecs-app"
-                sh "docker push 024848443289.dkr.ecr.us-east-1.amazonaws.com/nodejs-ecs-app"
-                
+                script {
+                    def ecrUri
+                    if (params.DEPLOY_ENV == 'beta') {
+                        ecrUri = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/beta-nodejs-ecs-app"
+                    } else if (params.DEPLOY_ENV == 'stage') {
+                        ecrUri = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/stage-nodejs-ecs-app"
+                    } else {
+                        ecrUri = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/prod-nodejs-ecs-app"
+                    }
+                    sh "docker push ${ecrUri}:${IMAGE_TAG}"
+                }
             }
         }
-        
-        stage ("Deploy to K8S") {
+
+        stage("SonarQube Analysis") {
+            when {
+                expression { params.SONARQUBE }
+            }
             steps {
-                withKubeConfig(caCertificate: '', clusterName: '', contextName: '', credentialsId: 'K8S', namespace: '', restrictKubeConfigAccess: false, serverUrl: '') {
-                sh "kubectl apply -f eks-deploy-k8s.yaml"
-                    
+                script {
+                    // Add your SonarQube analysis command here
+                    sh "mvn sonar:sonar -Dsonar.projectKey=your_project_key"
+                }
+            }
+        }
+
+        stage("Deploy to K8S") {
+            steps {
+                script {
+                    def env = params.DEPLOY_ENV
+                    withKubeConfig(caCertificate: '', clusterName: '', contextName: '', credentialsId: 'K8S', namespace: '', restrictKubeConfigAccess: false, serverUrl: '') {
+                        sh "kubectl apply -f eks-deploy-k8s-${env}.yaml"
+                    }
                 }
             }
         }
